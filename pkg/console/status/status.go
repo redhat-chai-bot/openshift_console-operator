@@ -179,7 +179,14 @@ func (c *StatusHandler) AddConditions(conditionUpdates []ConditionUpdate) {
 	}
 }
 
-func (c *StatusHandler) FlushAndReturn(returnErr error) error {
+func (c *StatusHandler) FlushAndReturn(ctx context.Context, returnErr error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if returnErr != nil {
+			return returnErr
+		}
+		return ctxErr
+	}
+
 	allStatusFns := []v1helpers.UpdateStatusFunc{}
 	for i := range c.statusFuncs {
 		allStatusFns = append(allStatusFns, c.statusFuncs[i])
@@ -188,7 +195,13 @@ func (c *StatusHandler) FlushAndReturn(returnErr error) error {
 		allStatusFns = append(allStatusFns, c.conditionUpdates[k])
 	}
 
-	if _, _, updateErr := v1helpers.UpdateStatus(context.TODO(), c.client, allStatusFns...); updateErr != nil {
+	if _, _, updateErr := v1helpers.UpdateStatus(ctx, c.client, allStatusFns...); updateErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if returnErr != nil {
+				return returnErr
+			}
+			return ctxErr
+		}
 		return updateErr
 	}
 	return returnErr

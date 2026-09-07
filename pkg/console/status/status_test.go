@@ -1,10 +1,13 @@
 package status
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"testing"
 
 	operatorsv1 "github.com/openshift/api/operator/v1"
+	"github.com/openshift/library-go/pkg/operator/v1helpers"
 )
 
 func TestHandleProgressingOrDegraded_NilError_ClearsConditions(t *testing.T) {
@@ -120,4 +123,105 @@ func TestHandleProgressingOrDegraded_WithError_SetsDegradedTrue(t *testing.T) {
 			t.Errorf("expected condition %q to be present but was not found", condType)
 		}
 	}
+}
+
+func TestStatusHandlerFlushAndReturnCanceledContext(t *testing.T) {
+	wrappedCanceledErr := fmt.Errorf("failed to get OLM config: %w", context.Canceled)
+	tests := []struct {
+		name      string
+		returnErr error
+		wantErr   error
+	}{
+		{
+			name:      "returns original reconciliation error",
+			returnErr: wrappedCanceledErr,
+			wantErr:   wrappedCanceledErr,
+		},
+		{
+			name:    "returns context error without reconciliation error",
+			wantErr: context.Canceled,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &recordingOperatorClient{
+				OperatorClient: v1helpers.NewFakeOperatorClient(
+					&operatorsv1.OperatorSpec{},
+					&operatorsv1.OperatorStatus{},
+					nil,
+				),
+			}
+			statusHandler := NewStatusHandler(client)
+			statusHandler.AddConditions(HandleProgressingOrDegraded("Test", "FailedGet", fmt.Errorf("genuine API error")))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			gotErr := statusHandler.FlushAndReturn(ctx, tt.returnErr)
+			if gotErr != tt.wantErr {
+				t.Fatalf("expected error %v, got %v", tt.wantErr, gotErr)
+			}
+			if client.updateCalls != 0 {
+				t.Fatalf("expected no status update, got %d", client.updateCalls)
+			}
+
+			_, operatorStatus, _, err := client.GetOperatorState()
+			if err != nil {
+				t.Fatalf("failed to get operator state: %v", err)
+			}
+			if len(operatorStatus.Conditions) != 0 {
+				t.Fatalf("expected conditions to remain unchanged, got %#v", operatorStatus.Conditions)
+			}
+		})
+	}
+}
+
+func TestStatusHandlerFlushAndReturnActiveContextPersistsDegraded(t *testing.T) {
+	client := &recordingOperatorClient{
+		OperatorClient: v1helpers.NewFakeOperatorClient(
+			&operatorsv1.OperatorSpec{},
+			&operatorsv1.OperatorStatus{},
+			nil,
+		),
+	}
+	statusHandler := NewStatusHandler(client)
+	genuineErr := errors.New("genuine API error")
+	statusHandler.AddConditions(HandleProgressingOrDegraded("Test", "FailedGet", genuineErr))
+
+	gotErr := statusHandler.FlushAndReturn(context.Background(), genuineErr)
+	if gotErr != genuineErr {
+		t.Fatalf("expected original reconciliation error %v, got %v", genuineErr, gotErr)
+	}
+	if client.updateCalls != 1 {
+		t.Fatalf("expected one status update, got %d", client.updateCalls)
+	}
+
+	_, operatorStatus, _, err := client.GetOperatorState()
+	if err != nil {
+		t.Fatalf("failed to get operator state: %v", err)
+	}
+	condition := v1helpers.FindOperatorCondition(operatorStatus.Conditions, "TestDegraded")
+	if condition == nil {
+		t.Fatal("expected TestDegraded condition")
+	}
+	if condition.Status != operatorsv1.ConditionTrue {
+		t.Fatalf("expected TestDegraded=True, got %s", condition.Status)
+	}
+	if condition.Reason != "FailedGet" {
+		t.Fatalf("expected reason FailedGet, got %q", condition.Reason)
+	}
+	if condition.Message != genuineErr.Error() {
+		t.Fatalf("expected message %q, got %q", genuineErr, condition.Message)
+	}
+}
+
+type recordingOperatorClient struct {
+	v1helpers.OperatorClient
+	updateCalls int
+}
+
+func (c *recordingOperatorClient) UpdateOperatorStatus(ctx context.Context, resourceVersion string, status *operatorsv1.OperatorStatus) (*operatorsv1.OperatorStatus, error) {
+	c.updateCalls++
+	return c.OperatorClient.UpdateOperatorStatus(ctx, resourceVersion, status)
 }
