@@ -20,6 +20,10 @@ metadata:
       repositories, Git endpoints, and ArtifactHub catalogs
       configured via HelmChartRepository custom resources;
       (4) OAuth and OIDC authentication endpoints; and (5) DNS.
+      Some console backend destinations are selected at request time
+      from user-entered URLs or user-provided devfile or Helm chart
+      content. Cluster administrators may choose stricter after-market
+      egress policies at the cost of disabling those features.
       The downloads server pods are intentionally excluded and have
       no egress allowance.
 spec:
