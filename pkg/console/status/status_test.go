@@ -177,6 +177,101 @@ func TestStatusHandlerFlushAndReturnCanceledContext(t *testing.T) {
 	}
 }
 
+func TestStatusHandlerFlushAndReturnCancellationDuringNoopStatusFlush(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &recordingOperatorClient{
+		OperatorClient: v1helpers.NewFakeOperatorClient(
+			&operatorsv1.OperatorSpec{},
+			&operatorsv1.OperatorStatus{},
+			nil,
+		),
+		beforeGet: cancel,
+	}
+	statusHandler := NewStatusHandler(client)
+
+	gotErr := statusHandler.FlushAndReturn(ctx, nil)
+	if gotErr != context.Canceled {
+		t.Fatalf("expected context cancellation, got %v", gotErr)
+	}
+	if client.updateCalls != 0 {
+		t.Fatalf("expected no status update for a no-op flush, got %d", client.updateCalls)
+	}
+}
+
+func TestStatusHandlerFlushAndReturnCancellationDuringStatusUpdate(t *testing.T) {
+	reconciliationErr := errors.New("reconciliation error")
+	tests := []struct {
+		name      string
+		returnErr error
+		wantErr   error
+	}{
+		{
+			name:      "returns original reconciliation error",
+			returnErr: reconciliationErr,
+			wantErr:   reconciliationErr,
+		},
+		{
+			name:    "returns context error without reconciliation error",
+			wantErr: context.Canceled,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			client := &recordingOperatorClient{
+				OperatorClient: v1helpers.NewFakeOperatorClient(
+					&operatorsv1.OperatorSpec{},
+					&operatorsv1.OperatorStatus{},
+					nil,
+				),
+				beforeUpdate: cancel,
+			}
+			statusHandler := NewStatusHandler(client)
+			statusHandler.AddCondition(HandleDegraded("Test", "FailedGet", errors.New("genuine API error")))
+
+			gotErr := statusHandler.FlushAndReturn(ctx, tt.returnErr)
+			if gotErr != tt.wantErr {
+				t.Fatalf("expected error %v, got %v", tt.wantErr, gotErr)
+			}
+			if client.updateCalls != 1 {
+				t.Fatalf("expected one attempted status update, got %d", client.updateCalls)
+			}
+
+			_, operatorStatus, _, err := client.GetOperatorState()
+			if err != nil {
+				t.Fatalf("failed to get operator state: %v", err)
+			}
+			if len(operatorStatus.Conditions) != 0 {
+				t.Fatalf("expected conditions to remain unchanged, got %#v", operatorStatus.Conditions)
+			}
+		})
+	}
+}
+
+func TestStatusHandlerFlushAndReturnActiveContextReturnsStatusUpdateError(t *testing.T) {
+	reconciliationErr := errors.New("reconciliation error")
+	statusUpdateErr := errors.New("status update error")
+	client := &recordingOperatorClient{
+		OperatorClient: v1helpers.NewFakeOperatorClient(
+			&operatorsv1.OperatorSpec{},
+			&operatorsv1.OperatorStatus{},
+			nil,
+		),
+		updateErr: statusUpdateErr,
+	}
+	statusHandler := NewStatusHandler(client)
+	statusHandler.AddCondition(HandleDegraded("Test", "FailedGet", reconciliationErr))
+
+	gotErr := statusHandler.FlushAndReturn(context.Background(), reconciliationErr)
+	if gotErr != statusUpdateErr {
+		t.Fatalf("expected status update error %v, got %v", statusUpdateErr, gotErr)
+	}
+	if client.updateCalls != 1 {
+		t.Fatalf("expected one attempted status update, got %d", client.updateCalls)
+	}
+}
+
 func TestStatusHandlerFlushAndReturnActiveContextPersistsDegraded(t *testing.T) {
 	client := &recordingOperatorClient{
 		OperatorClient: v1helpers.NewFakeOperatorClient(
@@ -218,10 +313,29 @@ func TestStatusHandlerFlushAndReturnActiveContextPersistsDegraded(t *testing.T) 
 
 type recordingOperatorClient struct {
 	v1helpers.OperatorClient
-	updateCalls int
+	beforeGet    func()
+	beforeUpdate func()
+	updateErr    error
+	updateCalls  int
+}
+
+func (c *recordingOperatorClient) GetOperatorState() (*operatorsv1.OperatorSpec, *operatorsv1.OperatorStatus, string, error) {
+	if c.beforeGet != nil {
+		c.beforeGet()
+	}
+	return c.OperatorClient.GetOperatorState()
 }
 
 func (c *recordingOperatorClient) UpdateOperatorStatus(ctx context.Context, resourceVersion string, status *operatorsv1.OperatorStatus) (*operatorsv1.OperatorStatus, error) {
 	c.updateCalls++
+	if c.beforeUpdate != nil {
+		c.beforeUpdate()
+	}
+	if c.updateErr != nil {
+		return nil, c.updateErr
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	return c.OperatorClient.UpdateOperatorStatus(ctx, resourceVersion, status)
 }
