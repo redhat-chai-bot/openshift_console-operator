@@ -173,6 +173,9 @@ func (c *RouteSyncController) Sync(ctx context.Context, controllerContext factor
 	// out the sync loop and inform about this fact instead of putting default
 	// route into inaccessible state.
 	_, customRouteErrReason, customRouteErr := c.SyncCustomRoute(ctx, routeConfig, ingressControllerConfig, controllerContext)
+	if customRouteErr != nil && ctx.Err() != nil {
+		return customRouteErr
+	}
 	statusHandler.AddConditions(status.HandleProgressingOrDegraded(typePrefix, customRouteErrReason, customRouteErr))
 	statusHandler.AddCondition(status.HandleUpgradable(typePrefix, customRouteErrReason, customRouteErr))
 	if customRouteErr != nil {
