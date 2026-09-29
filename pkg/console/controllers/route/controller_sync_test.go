@@ -39,6 +39,7 @@ func TestSyncCustomRouteStatus(t *testing.T) {
 			for _, test := range []struct {
 				name            string
 				cancelOnDelete  bool
+				cancelOnGet     bool
 				cancelCause     error
 				deadlineExpired bool
 				cancelAtEOF     bool
@@ -48,6 +49,7 @@ func TestSyncCustomRouteStatus(t *testing.T) {
 				wantDegraded    bool
 			}{
 				{name: "canceled delete", cancelOnDelete: true, wantError: context.Canceled},
+				{name: "canceled custom route get", cancelOnGet: true, wantError: context.Canceled, wantDegraded: true},
 				{name: "wrapped canceled delete", cancelOnDelete: true, transportError: fmt.Errorf("delete: %w", context.Canceled), wantError: context.Canceled},
 				{name: "canceled delete with custom cause", cancelOnDelete: true, cancelCause: independentError, wantError: context.Canceled},
 				{name: "custom cause is not cancellation", cancelOnDelete: true, cancelCause: independentError, transportError: independentError, wantError: independentError, wantDegraded: true},
@@ -86,6 +88,11 @@ func TestSyncCustomRouteStatus(t *testing.T) {
 						ObjectMeta: metav1.ObjectMeta{Name: api.ConfigResourceName},
 						Spec:       configv1.IngressSpec{Domain: "apps.example.com"},
 					}
+					if test.cancelOnGet {
+						ingress.Spec.ComponentRoutes = []configv1.ComponentRouteSpec{{
+							Name: routeName, Namespace: api.OpenShiftConsoleNamespace, Hostname: "custom.apps.example.com",
+						}}
+					}
 					defaultRoute := routesub.NewRouteConfig(operatorConfig, ingress, routeName).DefaultRoute(nil, ingress)
 					defaultRoute.Status.Ingress = []routev1.RouteIngress{{
 						Host: defaultRoute.Spec.Host,
@@ -95,28 +102,39 @@ func TestSyncCustomRouteStatus(t *testing.T) {
 					}}
 					customRoutePath := "/apis/route.openshift.io/v1/namespaces/openshift-console/routes/" + routesub.GetCustomRouteName(routeName)
 					defaultRequests := 0
+					deleteRequests := 0
+					customGetRequests := 0
+					recovering := false
 					httpClient := &http.Client{Transport: routeSyncRoundTripper(func(request *http.Request) (*http.Response, error) {
 						var responseObject interface{}
 						responseCode := http.StatusOK
 						switch {
+						case request.Method == http.MethodGet && request.URL.Path == customRoutePath && test.cancelOnGet:
+							customGetRequests++
+							cancel()
+							return nil, ctx.Err()
 						case request.Method == http.MethodDelete && request.URL.Path == customRoutePath:
-							if test.cancelOnDelete {
+							deleteRequests++
+							if test.cancelOnDelete && !recovering {
 								cancel()
 							}
-							if test.transportError != nil {
+							if test.transportError != nil && !recovering {
 								return nil, test.transportError
 							}
 							if request.Context().Err() != nil {
 								return nil, request.Context().Err()
 							}
+							responseCode = test.deleteStatus
+							if recovering {
+								responseCode = http.StatusNotFound
+							}
 							reason := metav1.StatusReasonForbidden
-							if test.deleteStatus == http.StatusNotFound {
+							if responseCode == http.StatusNotFound {
 								reason = metav1.StatusReasonNotFound
 							}
-							responseCode = test.deleteStatus
 							responseObject = &metav1.Status{
 								TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Status"},
-								Status:   metav1.StatusFailure, Reason: reason, Code: int32(test.deleteStatus),
+								Status:   metav1.StatusFailure, Reason: reason, Code: int32(responseCode),
 								Message: "custom route delete failed",
 							}
 						case request.Method == http.MethodGet && request.URL.Path == strings.TrimSuffix(customRoutePath, "-custom"):
@@ -174,8 +192,15 @@ func TestSyncCustomRouteStatus(t *testing.T) {
 						routeLister: routelistersv1.NewRouteLister(routeSyncTestIndexer(t)),
 					}
 					syncErr := controller.Sync(ctx, nil)
-					if syncErr != nil && syncErr != recordingClient.deleteError {
-						t.Fatalf("original DELETE error replaced: sync=%v delete=%v", syncErr, recordingClient.deleteError)
+					originalError := recordingClient.deleteError
+					if test.cancelOnGet {
+						originalError = recordingClient.getError
+						if deleteRequests != 0 || customGetRequests != 1 {
+							t.Fatalf("expected custom route GET only: deletes=%d customGets=%d", deleteRequests, customGetRequests)
+						}
+					}
+					if syncErr != nil && syncErr != originalError {
+						t.Fatalf("original route error replaced: sync=%v original=%v", syncErr, originalError)
 					}
 					switch {
 					case test.wantError != nil:
@@ -201,7 +226,7 @@ func TestSyncCustomRouteStatus(t *testing.T) {
 					if syncErr == nil && defaultRequests == 0 {
 						t.Fatal("default route not reconciled after missing custom route")
 					}
-					contextEnded := test.cancelOnDelete || test.deadlineExpired || test.cancelAtEOF
+					contextEnded := test.cancelOnDelete || test.cancelOnGet || test.deadlineExpired || test.cancelAtEOF
 					if (ctx.Err() != nil) != contextEnded {
 						t.Fatalf("unexpected reconciliation context error: %v", ctx.Err())
 					}
@@ -214,7 +239,21 @@ func TestSyncCustomRouteStatus(t *testing.T) {
 						if statusUpdates != 0 || !reflect.DeepEqual(initialStatus, actualStatus) {
 							t.Fatalf("canceled reconciliation published status: updates=%d, conditions=%+v", statusUpdates, actualStatus.Conditions)
 						}
-						return
+						recovering = true
+						previousDeletes := deleteRequests
+						freshCtx, freshCancel := context.WithCancel(context.Background())
+						defer freshCancel()
+						if syncErr = controller.Sync(freshCtx, nil); syncErr != nil {
+							t.Fatalf("fresh-context reconciliation failed: %v", syncErr)
+						}
+						if freshCtx.Err() != nil || ctx.Err() == nil || deleteRequests != previousDeletes+1 || defaultRequests != 1 {
+							t.Fatalf("incorrect recovery: fresh=%v original=%v deletes=%d defaultGets=%d", freshCtx.Err(), ctx.Err(), deleteRequests, defaultRequests)
+						}
+						_, actualStatus, _, err = operatorClient.GetOperatorState()
+						if err != nil {
+							t.Fatal(err)
+						}
+						t.Logf("fresh-context recovery: statusWrites=%d defaultGets=%d", statusUpdates, defaultRequests)
 					}
 					if statusUpdates != 1 {
 						t.Fatalf("expected one status update, got %d", statusUpdates)
@@ -226,9 +265,15 @@ func TestSyncCustomRouteStatus(t *testing.T) {
 					wantStatus := operatorv1.ConditionFalse
 					if test.wantDegraded {
 						wantStatus = operatorv1.ConditionTrue
-						if condition.Reason != "FailedDeleteCustomRoutes" || condition.Message != syncErr.Error() {
-							t.Fatalf("expected detailed delete failure, got %+v", condition)
+						wantReason := "FailedDeleteCustomRoutes"
+						if test.cancelOnGet {
+							wantReason = "FailedCustomRouteApply"
 						}
+						if condition.Reason != wantReason || condition.Message != syncErr.Error() {
+							t.Fatalf("expected detailed route failure, got %+v", condition)
+						}
+					} else if condition.Reason != "" || condition.Message != "" {
+						t.Fatalf("successful reconciliation retained failure details: %+v", condition)
 					}
 					if condition.Status != wantStatus {
 						t.Fatalf("expected Degraded=%s, got %+v", wantStatus, condition)
@@ -272,15 +317,23 @@ func (body *routeSyncResponseBody) Close() error { return nil }
 type routeSyncRecordingClient struct {
 	routeclientv1.RoutesGetter
 	deleteError error
+	getError    error
 }
 
 func (client *routeSyncRecordingClient) Routes(namespace string) routeclientv1.RouteInterface {
-	return &routeSyncRecordingRoutes{RouteInterface: client.RoutesGetter.Routes(namespace), deleteError: &client.deleteError}
+	return &routeSyncRecordingRoutes{RouteInterface: client.RoutesGetter.Routes(namespace), deleteError: &client.deleteError, getError: &client.getError}
 }
 
 type routeSyncRecordingRoutes struct {
 	routeclientv1.RouteInterface
 	deleteError *error
+	getError    *error
+}
+
+func (routes *routeSyncRecordingRoutes) Get(ctx context.Context, name string, options metav1.GetOptions) (*routev1.Route, error) {
+	route, err := routes.RouteInterface.Get(ctx, name, options)
+	*routes.getError = err
+	return route, err
 }
 
 func (routes *routeSyncRecordingRoutes) Delete(ctx context.Context, name string, options metav1.DeleteOptions) error {

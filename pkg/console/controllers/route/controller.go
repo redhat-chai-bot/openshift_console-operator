@@ -40,6 +40,8 @@ import (
 	routesub "github.com/openshift/console-operator/pkg/console/subresource/route"
 )
 
+const failedDeleteCustomRoutesReason = "FailedDeleteCustomRoutes"
+
 type RouteSyncController struct {
 	routeName            string
 	isHealthCheckEnabled bool
@@ -174,7 +176,7 @@ func (c *RouteSyncController) Sync(ctx context.Context, controllerContext factor
 	// out the sync loop and inform about this fact instead of putting default
 	// route into inaccessible state.
 	_, customRouteErrReason, customRouteErr := c.SyncCustomRoute(ctx, routeConfig, ingressControllerConfig, controllerContext)
-	if customRouteErrReason == "FailedDeleteCustomRoutes" && isCancellationOnly(customRouteErr, ctx.Err()) {
+	if customRouteErrReason == failedDeleteCustomRoutesReason && isCancellationOnly(customRouteErr, ctx.Err()) {
 		return customRouteErr
 	}
 	statusHandler.AddConditions(status.HandleProgressingOrDegraded(typePrefix, customRouteErrReason, customRouteErr))
@@ -254,7 +256,7 @@ func (c *RouteSyncController) SyncDefaultRoute(ctx context.Context, routeConfig 
 func (c *RouteSyncController) SyncCustomRoute(ctx context.Context, routeConfig *routesub.RouteConfig, ingressControllerConfig *operatorsv1.IngressController, controllerContext factory.SyncContext) (*routev1.Route, string, error) {
 	if !routeConfig.IsCustomHostnameSet() {
 		if err := c.removeRoute(ctx, routesub.GetCustomRouteName(c.routeName)); err != nil {
-			return nil, "FailedDeleteCustomRoutes", err
+			return nil, failedDeleteCustomRoutesReason, err
 		}
 		return nil, "", nil
 	}
