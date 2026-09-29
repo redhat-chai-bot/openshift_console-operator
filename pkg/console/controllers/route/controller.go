@@ -2,6 +2,7 @@ package route
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -173,7 +174,7 @@ func (c *RouteSyncController) Sync(ctx context.Context, controllerContext factor
 	// out the sync loop and inform about this fact instead of putting default
 	// route into inaccessible state.
 	_, customRouteErrReason, customRouteErr := c.SyncCustomRoute(ctx, routeConfig, ingressControllerConfig, controllerContext)
-	if customRouteErr != nil && ctx.Err() != nil {
+	if customRouteErrReason == "FailedDeleteCustomRoutes" && isCancellationOnly(customRouteErr, ctx.Err()) {
 		return customRouteErr
 	}
 	statusHandler.AddConditions(status.HandleProgressingOrDegraded(typePrefix, customRouteErrReason, customRouteErr))
@@ -198,6 +199,19 @@ func (c *RouteSyncController) Sync(ctx context.Context, controllerContext factor
 
 	additionalRouteErr := c.syncAdditionalRoutes(ctx, ingressConfig, statusHandler)
 	return statusHandler.FlushAndReturn(additionalRouteErr)
+}
+
+func isCancellationOnly(err, contextErr error) bool {
+	if contextErr == nil {
+		return false
+	}
+	for err != nil {
+		if err == contextErr {
+			return true
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
 }
 
 func (c *RouteSyncController) removeRoute(ctx context.Context, routeName string) error {
